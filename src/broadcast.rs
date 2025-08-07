@@ -154,7 +154,6 @@ impl Broadcaster {
                     else {
                         continue;
                     };
-                    println!("Got Connection!");
                     let Ok(mut mutex) = sync.recv.lock() else {
                         break;
                     };
@@ -176,6 +175,31 @@ impl Broadcaster {
 
     fn state(&mut self) -> &mut BroadIpcSendState {
         unsafe { &mut *(self.mem.as_mut_ptr() as *mut BroadIpcSendState) }
+    }
+
+    /// Access the next `len` bytes for writing to. Pauses until the buffer has
+    /// that many contiguous bytes available.
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the requested length is larger than could ever fit in the
+    /// send buffer.
+    pub async fn prepare_message(&mut self, len: usize) -> &mut [u8] {
+        todo!()
+    }
+
+
+    /// Submit a message of length `len`. Pauses until there is an open slot in
+    /// the queue. In general, the sum of messages submitted with
+    /// `submit_message` should be no more than the length requested from the
+    /// last `prepare_message` call.
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if the submitted message length is larger than the remaining free
+    /// space in the buffer, or if it would go past the end of the buffer.
+    pub async fn submit_message(&mut self, len: usize) {
+        todo!()
     }
 }
 

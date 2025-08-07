@@ -1,19 +1,10 @@
-use std::{
-    ffi::c_void,
-    io::{self, IoSlice, IoSliceMut},
-    path::Path,
-    sync::atomic::Ordering,
-    time::UNIX_EPOCH,
-};
+use std::{io, path::Path, sync::atomic::Ordering};
 
-use memfile::MemFile;
-use tokio_seqpacket::{
-    UnixSeqpacket,
-    ancillary::{AncillaryMessageReader, AncillaryMessageWriter, OwnedAncillaryMessage},
-};
+use tokio_seqpacket::UnixSeqpacket;
 
 use crate::{
-    fd_from_ancillary, BroadIpcRecvState, BroadIpcSendState, MessageHeader, SIZE_HEADER, SIZE_RECV_STATE, SIZE_SEND_STATE, ST_ACTIVE, ST_CLOSED, ST_WAITING
+    BroadIpcRecvState, BroadIpcSendState, MessageHeader, SIZE_HEADER, SIZE_RECV_STATE,
+    SIZE_SEND_STATE, ST_ACTIVE, ST_CLOSED, ST_WAITING, new_mem, recv_mem, send_memfile,
 };
 
 /// Receiver side of a shared-mem Broadcasting IPC channel.
@@ -21,7 +12,7 @@ pub struct BroadReceiver {
     /// Receive state
     state: memmap2::MmapMut,
     /// Shared memory from sender
-    buf: memmap2::Mmap,
+    send: memmap2::Mmap,
     /// Queue depth, which we retrieved early from the sender's buffer.
     queue_depth: usize,
     /// The open connection to the sender
@@ -32,45 +23,13 @@ impl BroadReceiver {
     pub async fn open<P: AsRef<Path>>(address: P) -> std::io::Result<Self> {
         let conn = UnixSeqpacket::connect(address).await?;
 
-        // Get the shared send state memory file
-        let mut ancillary_buffer = [0; 128];
-        let io_buf = IoSliceMut::new(&mut []);
-        let (read_size, anc) = conn
-            .recv_vectored_with_ancillary(&mut [io_buf], &mut ancillary_buffer)
-            .await?;
+        let send = recv_mem(&conn).await?;
 
-        // Recover the shared send state memory
-        let fd = fd_from_ancillary(anc)?;
-        if read_size != 0 {
-            return Err(io::Error::other("non-zero read data on first ipc message"));
-        }
-
-        // Map the send state memory and do initial verification of it.
-        let fd = MemFile::from_fd(fd)?;
-        let seals = fd.get_seals()?;
-        if seals != crate::seals() {
-            return Err(io::Error::other("seals weren't set up as expected"));
-        }
-        let buf = unsafe { memmap2::Mmap::map(&fd)? };
-        if buf.len() < SIZE_SEND_STATE {
-            return Err(io::Error::other("memory map from sender is too small"));
-        }
-
-        // Construct our shared memory file, mmap it, and seal it.
-        let timestamp = UNIX_EPOCH.elapsed().unwrap();
-        let name = format!(
-            "ipc-teal-broadrecv.{}.{}",
-            timestamp.as_secs(),
-            timestamp.subsec_nanos()
-        );
-        let mem_file = MemFile::create_sealable(&name)?;
-        mem_file.set_len(SIZE_RECV_STATE as u64)?;
-        let mut state = unsafe { memmap2::MmapMut::map_mut(&mem_file)? };
-        mem_file.add_seals(crate::seals())?;
+        let (mem_file, mut state) = new_mem(SIZE_RECV_STATE)?;
 
         // Load our initial config from the send state.
         let ipc = unsafe { &mut *(state.as_mut_ptr() as *mut BroadIpcRecvState) };
-        let send_state = unsafe { &*(buf.as_ptr() as *const BroadIpcSendState) };
+        let send_state = unsafe { &*(send.as_ptr() as *const BroadIpcSendState) };
         ipc.recv_state.value.store(ST_ACTIVE, Ordering::Release);
         ipc.head.value.store(
             send_state.tail.value.load(Ordering::Acquire),
@@ -85,20 +44,17 @@ impl BroadReceiver {
 
         // Verify the buffer is at least large enough for the sender's state
         // struct and the send queue.
-        if buf.len() < (SIZE_SEND_STATE + queue_depth * SIZE_HEADER) {
-            return Err(io::Error::other("memory map from sender is too small for buffer and state"));
+        if send.len() < (SIZE_SEND_STATE + queue_depth * SIZE_HEADER) {
+            return Err(io::Error::other(
+                "memory map from sender is too small for buffer and state",
+            ));
         }
 
-        // Send the shared receive state memory file across
-        let mut ancillary_buffer = [0; 128];
-        let mut anc = AncillaryMessageWriter::new(&mut ancillary_buffer);
-        anc.add_fds(&[&mem_file])?;
-        let data = IoSlice::new(&[]);
-        conn.send_vectored_with_ancillary(&[data], &mut anc).await?;
+        send_memfile(&conn, &mem_file).await?;
 
         Ok(Self {
             state,
-            buf,
+            send,
             queue_depth,
             conn,
         })
@@ -106,6 +62,68 @@ impl BroadReceiver {
 
     fn state(&mut self) -> &mut BroadIpcRecvState {
         unsafe { &mut *(self.state.as_mut_ptr() as *mut BroadIpcRecvState) }
+    }
+
+    fn send_state(&self) -> &BroadIpcSendState {
+        unsafe { &*(self.send.as_ptr() as *const &BroadIpcSendState) }
+    }
+
+    /// Determine if the sender is closed.
+    pub fn is_closed(&self) -> bool {
+        self.send_state().send_state.value.load(Ordering::Acquire) == ST_CLOSED
+    }
+
+    /// Receive a message. Returns None if the sender has closed the channel.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        let ret = unsafe { self.peek_raw() }.await.map(Vec::from);
+        self.advance().await;
+        ret
+    }
+
+    /// Peek the next message, and directly expose the byte buffer.
+    ///
+    /// Returns None if the sender has closed the channel.
+    ///
+    /// # SAFETY
+    ///
+    /// There's no guarantee the sending process won't modify the message after
+    /// it's been sent. You either must totally trust the sending process to
+    /// behave well, or be able to not care if the data is changed as you're
+    /// reading it.
+    pub async unsafe fn peek_raw(&mut self) -> Option<&[u8]> {
+        // 1. Set our state to waiting
+        // 2. Check the head & tail
+        // 3. If equal, no messages available. Sleep and wait for a UDS message (or failure).
+        // 4. After message, check tail again. If no change, go back to 3.
+        // 5. Messages available. Set our state to IDLE.
+        // 6. Try reading off the UDS connection until no messages are left.
+        // 7. Read a message header by copying it, verifying it, and then
+        //    returning a slice of memory pointing to the message.
+
+        let head = self.state().head.value.load(Ordering::Relaxed);
+        let tail = self.send_state().tail.value.load(Ordering::Acquire);
+        todo!()
+    }
+
+    /// Advance the receiver by one message. Panics if there was no pending message.
+    ///
+    /// This should be used to advance after using [`peek_raw`][Self::peek_raw].
+    pub async fn advance(&mut self) {
+        // Check that we can actually advance the head pointer, then do so.
+        let tail = self.send_state().tail.value.load(Ordering::Acquire);
+        let mut head = self.state().head.value.load(Ordering::Relaxed);
+        head += 1;
+        if head > tail {
+            panic!("Tried advancing past the end of the queue");
+        }
+        self.state().head.value.store(head, Ordering::Release);
+
+        // We might have held up the sender. Check it it went inactive, and wake it if so.
+        let send_state = self.send_state().send_state.value.load(Ordering::Acquire);
+        if send_state == ST_WAITING {
+            // TODO: Should we shut down the receiver on a failed send?
+            let _ = self.conn.send(&[]).await;
+        }
     }
 }
 
