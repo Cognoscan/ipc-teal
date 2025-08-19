@@ -16,15 +16,16 @@ impl Server {
     pub async fn accept(&self) -> Result<Connecting> { todo!() }
 
     /// Take a raw UDS socket file descriptor and attempt to connect it to the broadcaster.
-    pub async fn connect_raw_fd(&self, fd: RawFd) -> Result<()> { todo!() }
+    pub async fn connect_raw_fd(&self, fd: RawFd) -> Result<Connecting> { todo!() }
 
     /// Get a list of all attached peers.
     pub fn peers(&self) -> Result<Vec<UCred>> { todo!() }
 }
 
 /// Connect to a broadcaster.
-pub async fn connect(location: &str) -> Result<Receiver> { todo!() }
+pub async fn connect(location: &str) -> Result<Connecting> { todo!() }
 
+/// Broadcast-side attempted connection.
 struct Connecting;
 impl Connecting {
     /// Allow the connection to complete.
@@ -35,6 +36,15 @@ impl Connecting {
 
     /// Get a list of all already attached peers.
     pub fn peers(&self) -> Result<Vec<UCred>> { todo!() }
+}
+
+/// Receiver-side attempted connection.
+struct Connection;
+impl Connection {
+    pub async fn complete(self) -> Result<Receiver> { todo!() }
+    pub fn peer_cred(&self) -> Result<UCred> { todo!() }
+    pub fn peer_mem_size(&self) -> usize { todo!() }
+    pub fn peer_slots(&self) -> usize { todo!() }
 }
 
 struct Sender;

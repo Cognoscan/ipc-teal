@@ -3,6 +3,15 @@ Bidirectional shared-memory channel. A server is set up to initialize the connec
 sender and receiver are agnostic to who initiates the connection.
 
 Supports bidirectional data transfer, though the connections do not need symmetric buffer sizes.
+
+Server side flow:
+1. Create a `Server`, accept connection attempts in a loop to get `Connecting`
+2. Validate each `Connecting`  as they come in, creating `(Sender,Receiver)` pairs on success.
+
+Client side flow:
+1. Connect to a server, getting a `Connection` on success.
+2. Validate the `Connection` has the expected properties, then complete to get a 
+   `(Sender,Receiver)` pair on success.
 */
 
 struct Server;
@@ -16,7 +25,7 @@ impl Server {
 }
 
 /// Connect to a server.
-pub async fn connect(location: &str, mem_size: usize, slots: usize) -> Result<(Sender, Receiver)> { todo!() }
+pub async fn connect(location: &str, mem_size: usize, slots: usize) -> Result<Connection> { todo!() }
 
 /// Take a raw UDS socket file descriptor and attempt to make it into a shared-memory channel.
 ///
@@ -24,14 +33,24 @@ pub async fn connect(location: &str, mem_size: usize, slots: usize) -> Result<(S
 /// one of ends being handed off to a remote or child process before starting the connection.
 ///
 /// [uds_pair]: https://docs.rs/tokio-seqpacket/latest/tokio_seqpacket/struct.UnixSeqpacket.html#method.pair
-pub async fn connect_raw_fd(fd: RawFd) -> Result<(Sender, Receiver)> { todo!() }
+pub async fn connect_raw_fd(fd: RawFd, mem_size: usize, slots: usize) -> Result<Connection> { todo!() }
 
+/// Server-side attempted connection.
 struct Connecting;
 impl Connecting {
     pub async fn complete(self, mem_size: usize, slots: usize) -> Result<(Sender, Receiver)> { todo!() }
     pub fn peer_cred(&self) -> Result<UCred> { todo!() }
     pub fn peer_mem_size(&self) -> usize { todo!() }
-    pub fn perr_slots(&self) -> usize { todo!() }
+    pub fn peer_slots(&self) -> usize { todo!() }
+}
+
+/// Client-side attempted connection.
+struct Connection;
+impl Connection {
+    pub async fn complete(self) -> Result<(Sender, Receiver)> { todo!() }
+    pub fn peer_cred(&self) -> Result<UCred> { todo!() }
+    pub fn peer_mem_size(&self) -> usize { todo!() }
+    pub fn peer_slots(&self) -> usize { todo!() }
 }
 
 struct Sender;
